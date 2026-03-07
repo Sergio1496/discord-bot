@@ -7,15 +7,25 @@ import libsql_client
 from datetime import datetime
 import re
 import os
+import logging
 from dotenv import load_dotenv
 from discord import Embed
 from discord.ui import View
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger('bot')
+
 intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
+intents.voice_states = True
+intents.members = True
 intents.message_content = True
 invisible_char = "\u200b"
 
@@ -41,15 +51,17 @@ class MyBot(commands.Bot):
             auth_token=os.environ['TURSO_TOKEN']
         )
         await self.init_db()
+        log.info('Base de datos inicializada correctamente.')
         # Start health check HTTP server for Koyeb
         app = web.Application()
         app.router.add_get('/', self.health_check)
         app.router.add_get('/health', self.health_check)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8000)))
+        port = int(os.environ.get('PORT', 8000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        print(f"Health check server started on port {os.environ.get('PORT', 8000)}")
+        log.info(f'Servidor health check iniciado en puerto {port}.')
 
     async def health_check(self, request):
         return web.Response(text='OK', status=200)
@@ -81,15 +93,70 @@ class MyBot(commands.Bot):
                 duration INTEGER
             )
         ''')
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS active_sessions (
+                user_id TEXT PRIMARY KEY,
+                user_name TEXT,
+                join_time TEXT
+            )
+        ''')
 
     async def on_ready(self):
-        print(f'{self.user} has connected to Discord!')
+        log.info(f'Bot conectado como {self.user} (ID: {self.user.id})')
+        log.info(f'Conectado a {len(self.guilds)} servidor(es).')
         await self.change_presence(activity=discord.Game(name="🤑buscar codiguitos🤑"))
-        self.check_websites.start()  # Start the task loop
+        await self.restore_voice_sessions()
+        self.check_websites.start()
+        log.info('Task loop de check_websites iniciado (cada 10 min).')
+
+    async def restore_voice_sessions(self):
+        """Restaura sesiones activas tras un reinicio del bot."""
+        log.info('Restaurando sesiones de voz...')
+        # Recopilar usuarios que están AHORA en canales de voz
+        current_voice_users = {}
+        for guild in self.guilds:
+            for vc in guild.voice_channels:
+                for member in vc.members:
+                    if not member.bot:
+                        current_voice_users[str(member.id)] = member
+
+        # Leer sesiones activas guardadas en la BD
+        result = await self.db.execute("SELECT user_id, user_name, join_time FROM active_sessions")
+        saved_sessions = {row[0]: (row[1], row[2]) for row in result.rows}
+
+        # Cerrar sesiones huérfanas (usuarios que ya no están en voz)
+        for user_id, (user_name, join_time_str) in saved_sessions.items():
+            if user_id not in current_voice_users:
+                # El usuario ya no está en un canal: cerrar sesión con la hora actual
+                join_time = datetime.strptime(join_time_str, "%Y-%m-%d %H:%M:%S")
+                leave_time = datetime.now()
+                duration = int((leave_time - join_time).total_seconds())
+                await self.db.execute(
+                    "INSERT INTO voice_sessions (user_id, user_name, join_time, leave_time, duration) VALUES (?, ?, ?, ?, ?)",
+                    [user_id, user_name, join_time_str, leave_time.strftime("%Y-%m-%d %H:%M:%S"), duration]
+                )
+                await self.db.execute("DELETE FROM active_sessions WHERE user_id = ?", [user_id])
+                log.info(f'Sesión huérfana cerrada para {user_name} (duración: {duration}s)')
+            else:
+                # El usuario sigue en voz: restaurar en memoria
+                join_time = datetime.strptime(join_time_str, "%Y-%m-%d %H:%M:%S")
+                self.active_voice_sessions[int(user_id)] = join_time
+                log.info(f'Sesión restaurada para {user_name} (desde {join_time_str})')
+
+        # Registrar usuarios en voz que NO tenían sesión guardada
+        for user_id_str, member in current_voice_users.items():
+            if user_id_str not in saved_sessions and int(user_id_str) not in self.active_voice_sessions:
+                join_time = datetime.now()
+                self.active_voice_sessions[member.id] = join_time
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO active_sessions (user_id, user_name, join_time) VALUES (?, ?, ?)",
+                    [user_id_str, member.name, join_time.strftime("%Y-%m-%d %H:%M:%S")]
+                )
+                log.info(f'Nueva sesión creada para {member.name} (detectado en canal al iniciar)')
 
 
     async def get_hsr_codes(self, url):
-        # Mark all codes as inactive
+        log.info('Scrapeando códigos de HSR...')
         await self.db.execute("UPDATE hsr_codes SET active = 0")
 
         headers = {
@@ -101,7 +168,7 @@ class MyBot(commands.Bot):
                 if response.status == 200:
                     text = await response.text()
                 else:
-                    print(f"Error: {response.status}")
+                    log.error(f'Error HTTP {response.status} al obtener códigos de HSR')
                     return []
 
         soup = BeautifulSoup(text, 'html.parser')
@@ -119,7 +186,7 @@ class MyBot(commands.Bot):
                     code = re.sub(r'\[.*\]', '', code)  # Remove anything between brackets
                     code = code.strip()  # Remove any leading or trailing whitespace
 
-                    print(code)
+                    log.debug(f'HSR código encontrado: {code}')
                     if 'bg-new' in cells[3].get('class', []):
                         # Check if code already exists
                         existing = await self.db.execute("SELECT code FROM hsr_codes WHERE code = ?", [code])
@@ -130,6 +197,7 @@ class MyBot(commands.Bot):
                             embed = Embed(title=":new: Nuevo código de Honkai Star Rail: :new:", color=0x00ff00)
                             embed.add_field(name=f"{code}", value=f"[Canjear](https://hsr.hoyoverse.com/gift?code={code}{invisible_char})", inline=False)
                             await channel.send(embed=embed)
+                            log.info(f'¡NUEVO código HSR detectado y anunciado!: {code}')
 
                             user_ids = ['317425052083552257']
                             for user_id in user_ids:
@@ -137,7 +205,7 @@ class MyBot(commands.Bot):
                                 try:
                                     await user.send(embed=embed)
                                 except discord.Forbidden:
-                                    print(f"No se pudo enviar un DM a {user.name}")
+                                    log.warning(f'No se pudo enviar DM a {user.name} (HSR)')
                             codes.append((code, datetime.now(), 1))
                         else:
                             await self.db.execute("UPDATE hsr_codes SET active = 1 WHERE code = ?", [code])
@@ -149,6 +217,7 @@ class MyBot(commands.Bot):
         return []
 
     async def get_dbd_codes(self, url):
+        log.info('Scrapeando códigos de DBD...')
         headers = {
             'User-Agent': MODERN_USER_AGENT
         }
@@ -158,7 +227,7 @@ class MyBot(commands.Bot):
                 if response.status == 200:
                     text = await response.text()
                 else:
-                    print(f"Error: {response.status}")
+                    log.error(f'Error HTTP {response.status} al obtener códigos de DBD')
                     return []
 
         soup = BeautifulSoup(text, 'html.parser')
@@ -166,7 +235,7 @@ class MyBot(commands.Bot):
 
         if uls:
             ul = uls[5]
-            print(ul)
+            log.debug('Lista UL de DBD encontrada')
             codes = []
             for li in ul.find_all('li'):
                 if li.find('strong'):
@@ -179,16 +248,17 @@ class MyBot(commands.Bot):
                         embed = Embed(title=":new: Nuevo código de Dead By Daylight: :new:", color=0x00ff00)
                         embed.add_field(name=f"{code}", value="", inline=False)
                         await channel.send(embed=embed)
+                        log.info(f'¡NUEVO código DBD detectado y anunciado!: {code}')
                         user_ids = ['317425052083552257']
                         for user_id in user_ids:
                             user = await self.fetch_user(user_id)
                             try:
                                 await user.send(embed=embed)
                             except discord.Forbidden:
-                                print(f"No se pudo enviar un DM a {user.name}")
+                                log.warning(f'No se pudo enviar DM a {user.name} (DBD)')
                     else:
                         await self.db.execute("UPDATE dbd_codes SET active = 1 WHERE code = ?", [code])
-                        print(f"El código {code} ya existe en la base de datos.")
+                        log.debug(f'DBD código {code} ya existe en la BD.')
                         date_added = existing.rows[0][0]
                     codes.append((code, date_added, 1))
             result = await self.db.execute("SELECT * FROM dbd_codes WHERE active = 0")
@@ -202,6 +272,7 @@ class MyBot(commands.Bot):
         return []
 
     async def get_gi_codes(self, url):
+        log.info('Scrapeando códigos de Genshin Impact...')
         headers = {
             'User-Agent': MODERN_USER_AGENT
         }
@@ -211,7 +282,7 @@ class MyBot(commands.Bot):
                 if response.status == 200:
                     text = await response.text()
                 else:
-                    print(f"Error: {response.status}")
+                    log.error(f'Error HTTP {response.status} al obtener códigos de GI')
                     return []
 
         soup = BeautifulSoup(text, 'html.parser')
@@ -239,19 +310,20 @@ class MyBot(commands.Bot):
                             embed = Embed(title=":new: Nuevo código de Genshin Impact: :new:", color=0x00ff00)
                             embed.add_field(name=f"{code}", value=f"[Canjear](https://genshin.hoyoverse.com/es/gift?code={code})", inline=False)
                             await channel.send(embed=embed)
+                            log.info(f'¡NUEVO código GI detectado y anunciado!: {code}')
                             user_ids = ['317425052083552257', '244466932718239744', '698588699042119711']
                             for user_id in user_ids:
                                 user = await self.fetch_user(user_id)
                                 try:
                                     await user.send(embed=embed)
                                 except discord.Forbidden:
-                                    print(f"No se pudo enviar un DM a {user.name}")
+                                    log.warning(f'No se pudo enviar DM a {user.name} (GI)')
                             if not active:
                                 await self.db.execute("UPDATE gi_codes SET active = 0 WHERE code = ?", [code])
-                                print(f"El código {code} ya no está activo.")
+                                log.info(f'GI código {code} marcado como inactivo.')
                         else:
                             await self.db.execute("UPDATE gi_codes SET active = 1 WHERE code = ?", [code])
-                            print(f"El código {code} ya existe en la base de datos.")
+                            log.debug(f'GI código {code} ya existe en la BD.')
                             date_added = existing.rows[0][0]
                         codes.append((code, date_added, 1))
 
@@ -261,12 +333,13 @@ class MyBot(commands.Bot):
             removed_codes = db_codes - scraped_codes
             for code in removed_codes:
                 await self.db.execute("DELETE FROM gi_codes WHERE code = ?", [code])
-                print(f"El código {code} fue eliminado de la base de datos por no estar presente en la web.")
+                log.info(f'GI código {code} eliminado de la BD (ya no está en la web).')
 
             return codes
         return []
 
     async def get_poke_codes(self, url):
+        log.info('Scrapeando códigos de Pokémon TCG Pocket...')
         headers = {
             'User-Agent': MODERN_USER_AGENT
         }
@@ -276,7 +349,7 @@ class MyBot(commands.Bot):
                 if response.status == 200:
                     text = await response.text()
                 else:
-                    print(f"Error: {response.status}")
+                    log.error(f'Error HTTP {response.status} al obtener códigos de Pokémon')
                     return []
 
         soup = BeautifulSoup(text, 'html.parser')
@@ -306,6 +379,7 @@ class MyBot(commands.Bot):
                             embed = Embed(title=":new: Nuevo código de Pokémon TCG Pocket: :new:", color=0x00ff00)
                             embed.add_field(name=f"{code}", value=f"[Canjear](https://gift.pokemontcgpocket.com/es/)", inline=False)
                             await channel.send(embed=embed)
+                            log.info(f'¡NUEVO código Pokémon detectado y anunciado!: {code}')
 
                             user_ids = ['317425052083552257', '244466932718239744', '698588699042119711', '348929639944814592', '273427129813827584']
                             for user_id in user_ids:
@@ -313,12 +387,12 @@ class MyBot(commands.Bot):
                                 try:
                                     await user.send(embed=embed)
                                 except discord.Forbidden:
-                                    print(f"No se pudo enviar un DM a {user.name}")
+                                    log.warning(f'No se pudo enviar DM a {user.name} (Pokémon)')
 
                             codes.append((code, date_added, 1))
                         else:
                             await self.db.execute("UPDATE poke_codes SET active = 1 WHERE code = ?", [code])
-                            print(f"El código {code} ya existe en la base de datos.")
+                            log.debug(f'Pokémon código {code} ya existe en la BD.')
                             date_added = existing.rows[0][0]
                             codes.append((code, date_added, 1))
 
@@ -328,7 +402,7 @@ class MyBot(commands.Bot):
             removed_codes = db_codes - scraped_codes
             for code in removed_codes:
                 await self.db.execute("DELETE FROM poke_codes WHERE code = ?", [code])
-                print(f"El código {code} fue eliminado de la base de datos por no estar presente en la web.")
+                log.info(f'Pokémon código {code} eliminado de la BD (ya no está en la web).')
 
             return codes
         return []
@@ -359,8 +433,13 @@ class MyBot(commands.Bot):
             }
 
         ]
+        log.info('--- Inicio de ciclo de scraping de códigos ---')
         for game in games:
-            await game['function'](game['url'])
+            try:
+                await game['function'](game['url'])
+            except Exception as e:
+                log.error(f'Error scrapeando {game["name"]}: {e}')
+        log.info('--- Fin de ciclo de scraping ---')
 
     @check_websites.before_loop
     async def before_check_websites(self):
@@ -370,6 +449,7 @@ bot = MyBot(command_prefix='!', intents=intents)
 
 @bot.command(name='hsr')
 async def hsr(ctx):
+    log.info(f'Comando !hsr usado por {ctx.author} (ID: {ctx.author.id})')
     allowed_roles = [916018910904590447]
     allowed_users = [317425052083552257, 244466932718239744]
 
@@ -406,6 +486,7 @@ async def hsr(ctx):
 
 @bot.command(name='dbd')
 async def dbd(ctx):
+    log.info(f'Comando !dbd usado por {ctx.author} (ID: {ctx.author.id})')
     allowed_roles = [916018910904590447]
     allowed_users = [317425052083552257, 244466932718239744]
 
@@ -431,6 +512,7 @@ async def dbd(ctx):
 
 @bot.command(name='gi')
 async def gi(ctx):
+    log.info(f'Comando !gi usado por {ctx.author} (ID: {ctx.author.id})')
     allowed_roles = [916018910904590447]
     allowed_users = [317425052083552257, 244466932718239744]
 
@@ -462,6 +544,7 @@ async def gi(ctx):
 
 @bot.command(name='poke')
 async def poke(ctx):
+    log.info(f'Comando !poke usado por {ctx.author} (ID: {ctx.author.id})')
     allowed_roles = [916018910904590447]
     allowed_users = [317425052083552257, 244466932718239744, 273427129813827584]
 
@@ -495,6 +578,7 @@ bot.remove_command('help')
 @commands.has_any_role(916018910904590447)
 @bot.command(name='help')
 async def help(ctx):
+    log.info(f'Comando !help usado por {ctx.author} (ID: {ctx.author.id})')
     embed = discord.Embed(title="Ayuda", description="Algunos comandos útiles son:", color=0xeee657)
 
     embed.add_field(name="!hsr", value="Muestra códigos de Honkai Star Rail.", inline=False)
@@ -534,6 +618,7 @@ class RankingView(View):
 
 @bot.command(name='ranking')
 async def ranking(ctx):
+    log.info(f'Comando !ranking usado por {ctx.author} (ID: {ctx.author.id})')
     allowed_roles = [916018910904590447]
     allowed_users = [317425052083552257]
 
@@ -553,25 +638,32 @@ async def ranking(ctx):
 async def on_voice_state_update(member, before, after):
     # Si el usuario entra a un canal de voz
     if before.channel is None and after.channel is not None:
+        log.info(f'🔊 {member.name} se unió al canal de voz: {after.channel.name}')
         join_time = datetime.now()
         bot.active_voice_sessions[member.id] = join_time
+        await bot.db.execute(
+            "INSERT OR REPLACE INTO active_sessions (user_id, user_name, join_time) VALUES (?, ?, ?)",
+            [str(member.id), member.name, join_time.strftime("%Y-%m-%d %H:%M:%S")]
+        )
         join_str = join_time.strftime("%d/%m/%Y %H:%M:%S")
         notifier = await bot.fetch_user(317425052083552257)
         try:
             await notifier.send(f"{member} se ha unido al canal de voz: {after.channel.name} a las {join_str}.")
         except discord.Forbidden:
-            print(f"No se pudo enviar un DM a {notifier.name}")
+            log.warning(f'No se pudo enviar DM a {notifier.name} (voz join)')
     # Si el usuario cambia de canal de voz
     elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+        log.info(f'🔀 {member.name} cambió de canal: {before.channel.name} → {after.channel.name}')
         if member.id in bot.active_voice_sessions:
             join_time = bot.active_voice_sessions.pop(member.id)
             leave_time = datetime.now()
             duration = int((leave_time - join_time).total_seconds())
-            # Guardar en la BD
+            # Guardar en la BD y limpiar sesión activa
             await bot.db.execute(
                 "INSERT INTO voice_sessions (user_id, user_name, join_time, leave_time, duration) VALUES (?, ?, ?, ?, ?)",
                 [str(member.id), member.name, join_time.strftime("%Y-%m-%d %H:%M:%S"), leave_time.strftime("%Y-%m-%d %H:%M:%S"), duration]
             )
+            await bot.db.execute("DELETE FROM active_sessions WHERE user_id = ?", [str(member.id)])
             formatted_duration = format_duration(duration)
             join_str = join_time.strftime("%d/%m/%Y %H:%M:%S")
             leave_str = leave_time.strftime("%d/%m/%Y %H:%M:%S")
@@ -583,11 +675,17 @@ async def on_voice_state_update(member, before, after):
                     f"• Se unió a {after.channel.name} a las {leave_str}."
                 )
             except discord.Forbidden:
-                print(f"No se pudo enviar un DM a {notifier.name}")
+                log.warning(f'No se pudo enviar DM a {notifier.name} (voz switch)')
         # Registra la hora de entrada en el nuevo canal
-        bot.active_voice_sessions[member.id] = datetime.now()
+        new_join_time = datetime.now()
+        bot.active_voice_sessions[member.id] = new_join_time
+        await bot.db.execute(
+            "INSERT OR REPLACE INTO active_sessions (user_id, user_name, join_time) VALUES (?, ?, ?)",
+            [str(member.id), member.name, new_join_time.strftime("%Y-%m-%d %H:%M:%S")]
+        )
     # Si el usuario abandona el canal de voz
     elif before.channel is not None and after.channel is None:
+        log.info(f'🔇 {member.name} salió del canal de voz: {before.channel.name}')
         if member.id in bot.active_voice_sessions:
             join_time = bot.active_voice_sessions.pop(member.id)
             leave_time = datetime.now()
@@ -596,6 +694,7 @@ async def on_voice_state_update(member, before, after):
                 "INSERT INTO voice_sessions (user_id, user_name, join_time, leave_time, duration) VALUES (?, ?, ?, ?, ?)",
                 [str(member.id), member.name, join_time.strftime("%Y-%m-%d %H:%M:%S"), leave_time.strftime("%Y-%m-%d %H:%M:%S"), duration]
             )
+            await bot.db.execute("DELETE FROM active_sessions WHERE user_id = ?", [str(member.id)])
             formatted_duration = format_duration(duration)
             join_str = join_time.strftime("%d/%m/%Y %H:%M:%S")
             leave_str = leave_time.strftime("%d/%m/%Y %H:%M:%S")
@@ -606,13 +705,15 @@ async def on_voice_state_update(member, before, after):
                     f"Entró a las {join_str} y salió a las {leave_str} (tiempo en canal: {formatted_duration})."
                 )
             except discord.Forbidden:
-                print(f"No se pudo enviar un DM a {notifier.name}")
+                log.warning(f'No se pudo enviar DM a {notifier.name} (voz leave)')
 
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingAnyRole):
+        log.warning(f'{ctx.author} intentó usar !{ctx.command} sin permisos.')
         await ctx.send('Sorry pero tú no puedes usar esto 🥱')
     else:
+        log.error(f'Error en comando !{ctx.command} por {ctx.author}: {error}')
         raise error
 
 def format_duration(seconds):
@@ -627,4 +728,5 @@ def format_duration(seconds):
         result.append(f"{sec} segundo{'s' if sec != 1 else ''}")
     return ', '.join(result)
 
+log.info('Iniciando bot...')
 bot.run(os.environ['DISCORD_TOKEN'])
