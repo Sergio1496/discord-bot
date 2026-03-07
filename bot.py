@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 import aiohttp
+from aiohttp import web
 from bs4 import BeautifulSoup
 import libsql_client
 from datetime import datetime
@@ -17,6 +18,8 @@ intents.messages = True
 intents.guilds = True
 intents.message_content = True
 invisible_char = "\u200b"
+
+MODERN_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 #698588699042119711 angela
 #317425052083552257 sergio
@@ -38,6 +41,18 @@ class MyBot(commands.Bot):
             auth_token=os.environ['TURSO_TOKEN']
         )
         await self.init_db()
+        # Start health check HTTP server for Koyeb
+        app = web.Application()
+        app.router.add_get('/', self.health_check)
+        app.router.add_get('/health', self.health_check)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8000)))
+        await site.start()
+        print(f"Health check server started on port {os.environ.get('PORT', 8000)}")
+
+    async def health_check(self, request):
+        return web.Response(text='OK', status=200)
 
     async def init_db(self):
         await self.db.execute('''
@@ -78,7 +93,7 @@ class MyBot(commands.Bot):
         await self.db.execute("UPDATE hsr_codes SET active = 0")
 
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+            'User-Agent': MODERN_USER_AGENT
         }
 
         async with aiohttp.ClientSession() as session:
@@ -135,7 +150,7 @@ class MyBot(commands.Bot):
 
     async def get_dbd_codes(self, url):
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+            'User-Agent': MODERN_USER_AGENT
         }
 
         async with aiohttp.ClientSession() as session:
@@ -188,7 +203,7 @@ class MyBot(commands.Bot):
 
     async def get_gi_codes(self, url):
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+            'User-Agent': MODERN_USER_AGENT
         }
 
         async with aiohttp.ClientSession() as session:
@@ -253,7 +268,7 @@ class MyBot(commands.Bot):
 
     async def get_poke_codes(self, url):
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+            'User-Agent': MODERN_USER_AGENT
         }
 
         async with aiohttp.ClientSession() as session:
