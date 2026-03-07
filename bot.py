@@ -167,10 +167,18 @@ class MyBot(commands.Bot):
         log.info('Scrapeando códigos de HSR...')
         await self.db.execute("UPDATE hsr_codes SET active = 0")
 
+        api_url = 'https://honkai-star-rail.fandom.com/api.php'
+        params = {
+            'action': 'parse',
+            'page': 'Redemption_Code',
+            'format': 'json',
+            'prop': 'text',
+        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=MODERN_HEADERS) as response:
+            async with session.get(api_url, params=params, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
-                    text = await response.text()
+                    data = await response.json()
+                    text = data.get('parse', {}).get('text', {}).get('*', '')
                 else:
                     log.error(f'Error HTTP {response.status} al obtener códigos de HSR')
                     return []
@@ -273,10 +281,18 @@ class MyBot(commands.Bot):
 
     async def get_gi_codes(self, url):
         log.info('Scrapeando códigos de Genshin Impact...')
+        api_url = 'https://genshin-impact.fandom.com/api.php'
+        params = {
+            'action': 'parse',
+            'page': 'Promotional_Code',
+            'format': 'json',
+            'prop': 'text',
+        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=MODERN_HEADERS) as response:
+            async with session.get(api_url, params=params, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
-                    text = await response.text()
+                    data = await response.json()
+                    text = data.get('parse', {}).get('text', {}).get('*', '')
                 else:
                     log.error(f'Error HTTP {response.status} al obtener códigos de GI')
                     return []
