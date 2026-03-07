@@ -29,7 +29,15 @@ intents.members = True
 intents.message_content = True
 invisible_char = "\u200b"
 
-MODERN_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+MODERN_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,es;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0',
+}
 
 #698588699042119711 angela
 #317425052083552257 sergio
@@ -159,12 +167,8 @@ class MyBot(commands.Bot):
         log.info('Scrapeando códigos de HSR...')
         await self.db.execute("UPDATE hsr_codes SET active = 0")
 
-        headers = {
-            'User-Agent': MODERN_USER_AGENT
-        }
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
                     text = await response.text()
                 else:
@@ -218,12 +222,8 @@ class MyBot(commands.Bot):
 
     async def get_dbd_codes(self, url):
         log.info('Scrapeando códigos de DBD...')
-        headers = {
-            'User-Agent': MODERN_USER_AGENT
-        }
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
                     text = await response.text()
                 else:
@@ -273,12 +273,8 @@ class MyBot(commands.Bot):
 
     async def get_gi_codes(self, url):
         log.info('Scrapeando códigos de Genshin Impact...')
-        headers = {
-            'User-Agent': MODERN_USER_AGENT
-        }
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
                     text = await response.text()
                 else:
@@ -340,12 +336,8 @@ class MyBot(commands.Bot):
 
     async def get_poke_codes(self, url):
         log.info('Scrapeando códigos de Pokémon TCG Pocket...')
-        headers = {
-            'User-Agent': MODERN_USER_AGENT
-        }
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=MODERN_HEADERS) as response:
                 if response.status == 200:
                     text = await response.text()
                 else:
