@@ -52,6 +52,8 @@ MODERN_HEADERS = {
 
 # A quién se le reenvían los códigos de inicio de sesión de Spotify
 LEYRE_DISCORD_ID = 348929639944814592
+SERGIO_DISCORD_ID = 317425052083552257
+SPOTIFY_CODE_RECIPIENTS = [LEYRE_DISCORD_ID, SERGIO_DISCORD_ID]
 GMAIL_IMAP_HOST = 'imap.gmail.com'
 
 class MyBot(commands.Bot):
@@ -610,12 +612,13 @@ class MyBot(commands.Bot):
             else:
                 content = "🎵 Ha llegado un correo de Spotify, pero no se pudo extraer el código."
 
-            try:
-                user = await self.fetch_user(LEYRE_DISCORD_ID)
-                await user.send(content)
-                log.info('Código de Spotify reenviado a Leyre.')
-            except discord.HTTPException:
-                log.warning(f'No se pudo enviar el código de Spotify a {LEYRE_DISCORD_ID}')
+            for recipient_id in SPOTIFY_CODE_RECIPIENTS:
+                try:
+                    user = await self.fetch_user(recipient_id)
+                    await user.send(content)
+                    log.info(f'Código de Spotify reenviado a {recipient_id}.')
+                except discord.HTTPException:
+                    log.warning(f'No se pudo enviar el código de Spotify a {recipient_id}')
 
     @check_spotify_emails.before_loop
     async def before_check_spotify_emails(self):
