@@ -4,7 +4,12 @@ import aiohttp
 from aiohttp import web
 from bs4 import BeautifulSoup
 import libsql_client
-from datetime import datetime
+import asyncio
+import imaplib
+import email
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 import re
 import os
 import logging
@@ -45,6 +50,10 @@ MODERN_HEADERS = {
 #348929639944814592 leyre
 #273427129813827584 nat
 
+# A quién se le reenvían los códigos de inicio de sesión de Spotify
+LEYRE_DISCORD_ID = 348929639944814592
+GMAIL_IMAP_HOST = 'imap.gmail.com'
+
 class MyBot(commands.Bot):
     def __init__(self, command_prefix, intents):
         super().__init__(command_prefix=command_prefix, intents=intents)
@@ -70,6 +79,12 @@ class MyBot(commands.Bot):
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
         log.info(f'Servidor health check iniciado en puerto {port}.')
+        # Reenvío de códigos de Spotify (solo si hay credenciales de Gmail)
+        if os.environ.get('GMAIL_ADDRESS') and os.environ.get('GMAIL_APP_PASSWORD'):
+            self.check_spotify_emails.start()
+            log.info('Reenvío de códigos de Spotify activado.')
+        else:
+            log.info('GMAIL_ADDRESS/GMAIL_APP_PASSWORD no configurados: reenvío de Spotify desactivado.')
 
     async def health_check(self, request):
         return web.Response(text='OK', status=200)
@@ -106,6 +121,12 @@ class MyBot(commands.Bot):
                 user_id TEXT PRIMARY KEY,
                 user_name TEXT,
                 join_time TEXT
+            )
+        ''')
+        await self.db.execute('''
+            CREATE TABLE IF NOT EXISTS processed_emails (
+                message_id TEXT PRIMARY KEY,
+                processed_at TEXT
             )
         ''')
 
@@ -452,6 +473,153 @@ class MyBot(commands.Bot):
     @check_websites.before_loop
     async def before_check_websites(self):
         await self.wait_until_ready()  # Wait until the bot has connected to discord
+
+    # --- Reenvío de códigos de inicio de sesión de Spotify al DM de Leyre ---
+    # Solo se reenvían los correos recibidos en estos minutos: los códigos de
+    # Spotify caducan enseguida y así no se reenvían los antiguos al arrancar
+    SPOTIFY_RECENT_MINUTES = 15
+
+    def fetch_recent_spotify_emails(self):
+        """Lee el buzón por IMAP (bloqueante, se ejecuta en un hilo aparte).
+        Devuelve los correos recientes de Spotify ya parseados.
+        No marca los correos como leídos ni toca la base de datos."""
+        address = os.environ.get('GMAIL_ADDRESS')
+        password = os.environ.get('GMAIL_APP_PASSWORD')
+        if not address or not password:
+            return []
+
+        since = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%d-%b-%Y')
+        emails = []
+        with imaplib.IMAP4_SSL(GMAIL_IMAP_HOST) as imap:
+            imap.login(address, password)
+            imap.select('INBOX', readonly=True)  # readonly: no marca los correos como leídos
+            status, data = imap.search(None, f'(FROM "spotify" SINCE {since})')
+            if status != 'OK':
+                return []
+            for num in data[0].split():
+                status, msg_data = imap.fetch(num, '(RFC822)')
+                if status != 'OK' or not msg_data or not msg_data[0]:
+                    continue
+                msg = email.message_from_bytes(msg_data[0][1])
+                message_id = msg.get('Message-ID') or f'num-{num.decode()}'
+
+                date = msg.get('Date')
+                try:
+                    received = parsedate_to_datetime(date)
+                    if received.tzinfo is None:
+                        received = received.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    received = None
+                if received is not None:
+                    age = (datetime.now(timezone.utc) - received).total_seconds()
+                    if age > self.SPOTIFY_RECENT_MINUTES * 60:
+                        continue  # correo viejo: se ignora
+
+                subject = self.decode_mail_header(msg.get('Subject'))
+                body = self.extract_mail_body(msg)
+                emails.append({
+                    'message_id': message_id,
+                    'code': self.extract_login_code(subject, body),
+                    'link': self.extract_login_link(body),
+                })
+        return emails
+
+    @staticmethod
+    def decode_mail_header(value):
+        if not value:
+            return ''
+        out = ''
+        for text, enc in decode_header(value):
+            if isinstance(text, bytes):
+                out += text.decode(enc or 'utf-8', 'replace')
+            else:
+                out += text
+        return out
+
+    @staticmethod
+    def extract_mail_body(msg):
+        plain = html = ''
+        if msg.is_multipart():
+            for part in msg.walk():
+                if 'attachment' in (part.get('Content-Disposition') or '').lower():
+                    continue
+                ctype = part.get_content_type()
+                if ctype not in ('text/plain', 'text/html'):
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                text = payload.decode(part.get_content_charset() or 'utf-8', 'replace')
+                if ctype == 'text/plain' and not plain:
+                    plain = text
+                elif ctype == 'text/html' and not html:
+                    html = text
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload is not None:
+                text = payload.decode(msg.get_content_charset() or 'utf-8', 'replace')
+                if msg.get_content_type() == 'text/html':
+                    html = text
+                else:
+                    plain = text
+        # Si solo hay versión HTML, se saca el texto plano de ella
+        if html and not plain:
+            plain = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True)
+        return plain
+
+    @staticmethod
+    def extract_login_code(subject, body):
+        # Spotify manda un código numérico (normalmente de 6 dígitos)
+        match = re.search(r'\b(\d{6})\b', f"{subject}\n{body}")
+        return match.group(1) if match else None
+
+    @staticmethod
+    def extract_login_link(body):
+        # Algunos correos traen un enlace de acceso en vez de un código
+        for url in re.findall(r'https?://[^\s"\'<>]+', body):
+            if 'spotify' in url.lower():
+                return url
+        return None
+
+    @tasks.loop(seconds=20)
+    async def check_spotify_emails(self):
+        try:
+            # imaplib es bloqueante: se lee en un hilo aparte para no congelar el bot
+            loop = asyncio.get_running_loop()
+            emails = await loop.run_in_executor(None, self.fetch_recent_spotify_emails)
+        except Exception as e:
+            log.error(f'Error leyendo el correo de Spotify: {e}')
+            return
+
+        for mail in emails:
+            # Evita reenviar el mismo correo dos veces (también tras un reinicio)
+            existing = await self.db.execute(
+                "SELECT message_id FROM processed_emails WHERE message_id = ?", [mail['message_id']]
+            )
+            if existing.rows:
+                continue
+            await self.db.execute(
+                "INSERT INTO processed_emails (message_id, processed_at) VALUES (?, ?)",
+                [mail['message_id'], str(datetime.now())]
+            )
+
+            if mail['code']:
+                content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
+            elif mail['link']:
+                content = f"🎵 Enlace de inicio de sesión de Spotify:\n{mail['link']}"
+            else:
+                content = "🎵 Ha llegado un correo de Spotify, pero no se pudo extraer el código."
+
+            try:
+                user = await self.fetch_user(LEYRE_DISCORD_ID)
+                await user.send(content)
+                log.info('Código de Spotify reenviado a Leyre.')
+            except discord.HTTPException:
+                log.warning(f'No se pudo enviar el código de Spotify a {LEYRE_DISCORD_ID}')
+
+    @check_spotify_emails.before_loop
+    async def before_check_spotify_emails(self):
+        await self.wait_until_ready()
 
 bot = MyBot(command_prefix='!', intents=intents)
 
