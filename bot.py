@@ -522,7 +522,6 @@ class MyBot(commands.Bot):
                 emails.append({
                     'message_id': message_id,
                     'code': self.extract_login_code(subject, body),
-                    'link': self.extract_login_link(body),
                 })
         return emails
 
@@ -575,14 +574,6 @@ class MyBot(commands.Bot):
         match = re.search(r'\b(\d{6})\b', f"{subject}\n{body}")
         return match.group(1) if match else None
 
-    @staticmethod
-    def extract_login_link(body):
-        # Algunos correos traen un enlace de acceso en vez de un código
-        for url in re.findall(r'https?://[^\s"\'<>]+', body):
-            if 'spotify' in url.lower():
-                return url
-        return None
-
     @tasks.loop(seconds=20)
     async def check_spotify_emails(self):
         try:
@@ -605,12 +596,12 @@ class MyBot(commands.Bot):
                 [mail['message_id'], str(datetime.now())]
             )
 
-            if mail['code']:
-                content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
-            elif mail['link']:
-                content = f"🎵 Enlace de inicio de sesión de Spotify:\n{mail['link']}"
-            else:
-                content = "🎵 Ha llegado un correo de Spotify, pero no se pudo extraer el código."
+            # Solo se reenvían los códigos de inicio de sesión. Cualquier otro
+            # correo de Spotify (cambio de contraseña, avisos de seguridad,
+            # marketing...) se marca como procesado y se ignora.
+            if not mail['code']:
+                continue
+            content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
 
             for recipient_id in SPOTIFY_CODE_RECIPIENTS:
                 try:
