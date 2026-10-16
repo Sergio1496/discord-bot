@@ -585,31 +585,40 @@ class MyBot(commands.Bot):
             return
 
         for mail in emails:
-            # Evita reenviar el mismo correo dos veces (también tras un reinicio)
-            existing = await self.db.execute(
-                "SELECT message_id FROM processed_emails WHERE message_id = ?", [mail['message_id']]
-            )
-            if existing.rows:
-                continue
-            await self.db.execute(
-                "INSERT INTO processed_emails (message_id, processed_at) VALUES (?, ?)",
-                [mail['message_id'], str(datetime.now())]
-            )
+            # Una excepción sin capturar (p. ej. un fallo puntual de Turso) para el
+            # bucle para siempre hasta reiniciar el bot: se registra y el correo se
+            # reintenta en la siguiente vuelta, ya que no se ha marcado como procesado
+            try:
+                await self.forward_spotify_mail(mail)
+            except Exception:
+                log.exception(f"Error reenviando el correo de Spotify {mail['message_id']}")
 
-            # Solo se reenvían los códigos de inicio de sesión. Cualquier otro
-            # correo de Spotify (cambio de contraseña, avisos de seguridad,
-            # marketing...) se marca como procesado y se ignora.
-            if not mail['code']:
-                continue
-            content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
+    async def forward_spotify_mail(self, mail):
+        # Evita reenviar el mismo correo dos veces (también tras un reinicio)
+        existing = await self.db.execute(
+            "SELECT message_id FROM processed_emails WHERE message_id = ?", [mail['message_id']]
+        )
+        if existing.rows:
+            return
+        await self.db.execute(
+            "INSERT INTO processed_emails (message_id, processed_at) VALUES (?, ?)",
+            [mail['message_id'], str(datetime.now())]
+        )
 
-            for recipient_id in SPOTIFY_CODE_RECIPIENTS:
-                try:
-                    user = await self.fetch_user(recipient_id)
-                    await user.send(content)
-                    log.info(f'Código de Spotify reenviado a {recipient_id}.')
-                except discord.HTTPException:
-                    log.warning(f'No se pudo enviar el código de Spotify a {recipient_id}')
+        # Solo se reenvían los códigos de inicio de sesión. Cualquier otro
+        # correo de Spotify (cambio de contraseña, avisos de seguridad,
+        # marketing...) se marca como procesado y se ignora.
+        if not mail['code']:
+            return
+        content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
+
+        for recipient_id in SPOTIFY_CODE_RECIPIENTS:
+            try:
+                user = await self.fetch_user(recipient_id)
+                await user.send(content)
+                log.info(f'Código de Spotify reenviado a {recipient_id}.')
+            except discord.HTTPException:
+                log.warning(f'No se pudo enviar el código de Spotify a {recipient_id}')
 
     @check_spotify_emails.before_loop
     async def before_check_spotify_emails(self):
