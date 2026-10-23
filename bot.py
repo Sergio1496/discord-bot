@@ -7,11 +7,12 @@ import libsql_client
 import asyncio
 import imaplib
 import email
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 import re
 import os
+import time
 import logging
 from dotenv import load_dotenv
 from discord import Embed
@@ -55,6 +56,10 @@ LEYRE_DISCORD_ID = 348929639944814592
 SERGIO_DISCORD_ID = 317425052083552257
 SPOTIFY_CODE_RECIPIENTS = [LEYRE_DISCORD_ID, SERGIO_DISCORD_ID]
 GMAIL_IMAP_HOST = 'imap.gmail.com'
+# Cada cuántos segundos se mira el buzón (la conexión IMAP se mantiene abierta)
+SPOTIFY_POLL_SECONDS = 5
+# Si Gmail no responde en este tiempo se corta la conexión y se reabre
+IMAP_TIMEOUT = 30
 
 class MyBot(commands.Bot):
     def __init__(self, command_prefix, intents):
@@ -62,6 +67,8 @@ class MyBot(commands.Bot):
         self.announcement_channel_id = 1240423591099502653  # Replace with your channel ID
         self.active_voice_sessions = {}
         self.db = None
+        self.spotify_imap = None  # conexión IMAP persistente (solo se usa desde el hilo del executor)
+        self.spotify_seen = set()  # Message-IDs ya procesados, para no consultar Turso en cada vuelta
 
     async def setup_hook(self):
         url = os.environ['TURSO_URL'].replace("libsql://", "https://")
@@ -480,49 +487,103 @@ class MyBot(commands.Bot):
     # Solo se reenvían los correos recibidos en estos minutos: los códigos de
     # Spotify caducan enseguida y así no se reenvían los antiguos al arrancar
     SPOTIFY_RECENT_MINUTES = 15
+    # Cuántos de los últimos correos del buzón se revisan en cada vuelta
+    SPOTIFY_SCAN_LAST = 10
 
-    def fetch_recent_spotify_emails(self):
+    def get_spotify_imap(self):
+        """Devuelve la conexión IMAP abierta, abriéndola si hace falta.
+        Se reutiliza entre vueltas para no hacer login cada pocos segundos."""
+        if self.spotify_imap is None:
+            imap = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, timeout=IMAP_TIMEOUT)
+            imap.login(os.environ['GMAIL_ADDRESS'], os.environ['GMAIL_APP_PASSWORD'])
+            self.spotify_imap = imap
+            log.info('Conexión IMAP con Gmail abierta.')
+        return self.spotify_imap
+
+    def close_spotify_imap(self):
+        imap, self.spotify_imap = self.spotify_imap, None
+        if imap is not None:
+            try:
+                imap.shutdown()  # sin logout: si la conexión está caída, logout se quedaría esperando
+            except Exception:
+                pass
+
+    def fetch_recent_spotify_emails(self, seen):
         """Lee el buzón por IMAP (bloqueante, se ejecuta en un hilo aparte).
-        Devuelve los correos recientes de Spotify ya parseados.
+        Devuelve los correos recientes de Spotify que no estén en `seen`, ya parseados.
         No marca los correos como leídos ni toca la base de datos."""
-        address = os.environ.get('GMAIL_ADDRESS')
-        password = os.environ.get('GMAIL_APP_PASSWORD')
-        if not address or not password:
+        try:
+            return self.scan_spotify_emails(self.get_spotify_imap(), seen)
+        except Exception:
+            # Conexión rota, timeout, BYE de Gmail...: se reabre en la siguiente vuelta
+            self.close_spotify_imap()
+            raise
+
+    def scan_spotify_emails(self, imap, seen):
+        # No se usa SEARCH: en Gmail va contra el índice de búsqueda, que tarda
+        # en incluir los correos nuevos. Se miran directamente los últimos
+        # correos del buzón, que aparecen en cuanto llegan.
+        status, data = imap.select('INBOX', readonly=True)  # readonly: no marca los correos como leídos
+        if status != 'OK':
+            raise imaplib.IMAP4.error(f'No se pudo abrir INBOX: {data}')
+        total = int(data[0])
+        if total == 0:
             return []
+        first = max(1, total - self.SPOTIFY_SCAN_LAST + 1)
+        status, data = imap.fetch(
+            f'{first}:{total}', '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM MESSAGE-ID)])'
+        )
+        if status != 'OK':
+            raise imaplib.IMAP4.error(f'Error en FETCH: {data}')
 
-        since = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%d-%b-%Y')
+        # Cada correo llega como (metadatos, cabeceras) seguido de b')'. UID e
+        # INTERNALDATE pueden venir antes o después de las cabeceras, así que
+        # se junta todo lo que no son las cabeceras
+        records = []
+        for item in data:
+            if isinstance(item, tuple):
+                records.append([item[0], item[1]])
+            elif isinstance(item, bytes) and records:
+                records[-1][0] += item
+
+        now = time.time()
         emails = []
-        with imaplib.IMAP4_SSL(GMAIL_IMAP_HOST) as imap:
-            imap.login(address, password)
-            imap.select('INBOX', readonly=True)  # readonly: no marca los correos como leídos
-            status, data = imap.search(None, f'(FROM "spotify" SINCE {since})')
-            if status != 'OK':
-                return []
-            for num in data[0].split():
-                status, msg_data = imap.fetch(num, '(RFC822)')
-                if status != 'OK' or not msg_data or not msg_data[0]:
-                    continue
-                msg = email.message_from_bytes(msg_data[0][1])
-                message_id = msg.get('Message-ID') or f'num-{num.decode()}'
+        for meta, raw_headers in records:
+            headers = email.message_from_bytes(raw_headers)
+            if 'spotify' not in (headers.get('From') or '').lower():
+                continue
+            uid = re.search(rb'UID (\d+)', meta)
+            internal_date = imaplib.Internaldate2tuple(meta)
+            if not uid or not internal_date:
+                continue
+            uid = uid.group(1).decode()
+            # INTERNALDATE es cuando llegó a Gmail
+            arrived = time.mktime(internal_date)
+            if now - arrived > self.SPOTIFY_RECENT_MINUTES * 60:
+                continue  # correo viejo: se ignora
+            message_id = headers.get('Message-ID') or f'uid-{uid}'
+            if message_id in seen:
+                continue
 
-                date = msg.get('Date')
-                try:
-                    received = parsedate_to_datetime(date)
-                    if received.tzinfo is None:
-                        received = received.replace(tzinfo=timezone.utc)
-                except (TypeError, ValueError):
-                    received = None
-                if received is not None:
-                    age = (datetime.now(timezone.utc) - received).total_seconds()
-                    if age > self.SPOTIFY_RECENT_MINUTES * 60:
-                        continue  # correo viejo: se ignora
-
-                subject = self.decode_mail_header(msg.get('Subject'))
-                body = self.extract_mail_body(msg)
-                emails.append({
-                    'message_id': message_id,
-                    'code': self.extract_login_code(subject, body),
-                })
+            status, msg_data = imap.uid('FETCH', uid, '(BODY.PEEK[])')
+            if status != 'OK' or not msg_data or not isinstance(msg_data[0], tuple):
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            try:
+                sent = parsedate_to_datetime(msg.get('Date'))
+                if sent.tzinfo is None:
+                    sent = sent.replace(tzinfo=timezone.utc)
+                sent = sent.timestamp()
+            except (TypeError, ValueError):
+                sent = None
+            subject = self.decode_mail_header(msg.get('Subject'))
+            body = self.extract_mail_body(msg)
+            emails.append({
+                'message_id': message_id,
+                'code': self.extract_login_code(subject, body),
+                'sent': sent,
+                'arrived': arrived,
+            })
         return emails
 
     @staticmethod
@@ -574,12 +635,14 @@ class MyBot(commands.Bot):
         match = re.search(r'\b(\d{6})\b', f"{subject}\n{body}")
         return match.group(1) if match else None
 
-    @tasks.loop(seconds=20)
+    @tasks.loop(seconds=SPOTIFY_POLL_SECONDS)
     async def check_spotify_emails(self):
         try:
             # imaplib es bloqueante: se lee en un hilo aparte para no congelar el bot
             loop = asyncio.get_running_loop()
-            emails = await loop.run_in_executor(None, self.fetch_recent_spotify_emails)
+            emails = await loop.run_in_executor(
+                None, self.fetch_recent_spotify_emails, frozenset(self.spotify_seen)
+            )
         except Exception as e:
             log.error(f'Error leyendo el correo de Spotify: {e}')
             return
@@ -590,8 +653,21 @@ class MyBot(commands.Bot):
             # reintenta en la siguiente vuelta, ya que no se ha marcado como procesado
             try:
                 await self.forward_spotify_mail(mail)
+                self.spotify_seen.add(mail['message_id'])
             except Exception:
                 log.exception(f"Error reenviando el correo de Spotify {mail['message_id']}")
+
+    @staticmethod
+    def log_spotify_timing(mail):
+        # Deja constancia de dónde se va el tiempo: Spotify -> Gmail -> bot
+        def hhmmss(ts):
+            return datetime.fromtimestamp(ts).strftime('%H:%M:%S') if ts else '?'
+        now = time.time()
+        log.info(
+            f"Correo de Spotify con código: enviado por Spotify {hhmmss(mail['sent'])}, "
+            f"llegó a Gmail {hhmmss(mail['arrived'])}, detectado por el bot {hhmmss(now)} "
+            f"({now - mail['arrived']:.0f} s después de llegar a Gmail)."
+        )
 
     async def forward_spotify_mail(self, mail):
         # Evita reenviar el mismo correo dos veces (también tras un reinicio)
@@ -610,6 +686,7 @@ class MyBot(commands.Bot):
         # marketing...) se marca como procesado y se ignora.
         if not mail['code']:
             return
+        self.log_spotify_timing(mail)
         content = f"🎵 Código de inicio de sesión de Spotify: `{mail['code']}`"
 
         for recipient_id in SPOTIFY_CODE_RECIPIENTS:
